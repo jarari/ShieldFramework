@@ -5,6 +5,13 @@
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
+//#define DEBUG
+
+#ifdef DEBUG
+#define _DEBUGMESSAGE(fmt, ...) _MESSAGE(fmt __VA_OPT__(, ) __VA_ARGS__)
+#else
+#define _DEBUGMESSAGE(fmt, ...)
+#endif
 
 using std::unordered_map;
 using std::vector;
@@ -150,19 +157,12 @@ bool HasMod(BGSInventoryItem* invitem, BGSMod::Attachment::Mod* mod)
 	return false;
 }
 
-bool IsShield(uint32_t formID)
-{
-	auto sdlookup = shieldDataMap.find(formID);
-	if (sdlookup != shieldDataMap.end()) {
-		return true;
-	}
-	return false;
-}
-
 unordered_map<uint32_t, ShieldData>::iterator GetShieldData(uint32_t formID)
 {
 	auto sdlookup = shieldDataMap.find(formID);
+	_DEBUGMESSAGE("GetShieldData - Searching formID %llx", formID);
 	if (sdlookup != shieldDataMap.end()) {
+		_DEBUGMESSAGE("GetShieldData - Found");
 		return sdlookup;
 	}
 	return shieldDataMap.end();
@@ -182,6 +182,14 @@ unordered_map<uint32_t, ShieldData>::iterator GetShieldData(Actor* a)
 		}
 	}
 	return shieldDataMap.end();
+}
+
+bool IsShield(uint32_t formID)
+{
+	if (GetShieldData(formID) != shieldDataMap.end()) {
+		return true;
+	}
+	return false;
 }
 
 void CacheOMODData(Actor* a)
@@ -225,6 +233,15 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 	bool doDamage = true;
 	auto sdlookup = GetShieldData(a);
 	if (a->GetActorValue(*shieldHolder) != 0 && sdlookup != shieldDataMap.end()) {
+#ifdef DEBUG
+		_DEBUGMESSAGE("HookedDoHitMe - ShieldHolder %llx hit with dmg %f", a->formID, hitData.totalDamage);
+		if (hitData.impactData.collisionObj && hitData.impactData.collisionObj->sceneObject) {
+			_DEBUGMESSAGE("HookedDoHitMe - Collision object %s at %llx", hitData.impactData.collisionObj->sceneObject->name.c_str(), hitData.impactData.collisionObj->sceneObject);
+		}
+		if (hitData.sourceHandle.get().get()) {
+			_DEBUGMESSAGE("HookedDoHitMe - Source formID %llx at %llx", hitData.sourceHandle.get()->formID, hitData.sourceHandle.get().get());
+		}
+#endif
 		OMODData* od = GetCurrentOMODData(a);
 		//_MESSAGE("Actor %llx hit with dmg %f from %llx", a, hitData.totalDamage, hitData.source.object);
 		if (!od) {
@@ -417,9 +434,12 @@ void AttachMainOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 	if (!a->inventoryList) {
 		return;
 	}
+	_DEBUGMESSAGE("AttachMainOMOD - Actor %llx formID %llx", a->formID, formId);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
 		if (invitem->object->formID == formId) {
+			_DEBUGMESSAGE("AttachMainOMOD - Found item in inventory");
 			if (invitem->stackData->IsEquipped()) {
+				_DEBUGMESSAGE("AttachMainOMOD - Is Equipped");
 				for (auto omodit = sd.omods.begin(); omodit != sd.omods.end(); ++omodit) {
 					if (HasMod(invitem, omodit->groundOMOD)) {
 						AttachMainOMOD_Internal(a, *omodit, invitem);
@@ -428,7 +448,7 @@ void AttachMainOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 						}
 						a->SetBaseActorValue(*shieldHolder, 1.f);
 						omodDataCache.insert(std::pair<uint32_t, OMODData>(a->formID, *omodit));
-						_MESSAGE("Actor %llx Equip->AttachMainOMOD", a);
+						_MESSAGE("Actor %llx Equip->AttachMainOMOD", a->formID);
 						return;
 					}
 				}
@@ -442,8 +462,10 @@ void AttachGroundOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 	if (!a->inventoryList) {
 		return;
 	}
+	_DEBUGMESSAGE("AttachGroundOMOD - Actor %llx formID %llx", a->formID, formId);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
 		if (invitem->object->formID == formId) {
+			_DEBUGMESSAGE("AttachGroundOMOD - Found item in inventory");
 			for (auto omodit = sd.omods.begin(); omodit != sd.omods.end(); ++omodit) {
 				if (HasMod(invitem, omodit->mainOMOD)) {
 					AttachGroundOMOD_Internal(a, *omodit, invitem);
@@ -452,7 +474,7 @@ void AttachGroundOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 					}
 					a->SetBaseActorValue(*shieldHolder, 0.f);
 					omodDataCache.erase(a->formID);
-					_MESSAGE("Actor %llx Unequip->AttachGroundOMOD", a);
+					_MESSAGE("Actor %llx Unequip->AttachGroundOMOD", a->formID);
 					return;
 				}
 			}
@@ -466,11 +488,14 @@ void CheckShieldOMOD(Actor* a)
 		return;
 	}
 	bool hasShield = false;
+	_DEBUGMESSAGE("CheckShieldOMOD - Actor %llx", a->formID);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
 		auto sdlookup = GetShieldData(invitem->object->formID);
 		if (sdlookup != shieldDataMap.end()) {
+			_DEBUGMESSAGE("CheckShieldOMOD - Shield %llx", invitem->object->formID);
 			for (auto omodit = sdlookup->second.omods.begin(); omodit != sdlookup->second.omods.end(); ++omodit) {
 				if (invitem->stackData->IsEquipped()) {
+					_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
 					if (HasMod(invitem, omodit->groundOMOD)) {
 						AttachMainOMOD_Internal(a, *omodit, invitem);
 						if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
@@ -478,7 +503,7 @@ void CheckShieldOMOD(Actor* a)
 						}
 						GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
 						hasShield = true;
-						_MESSAGE("Actor %llx CheckShieldOMOD->AttachMainOMOD", a);
+						_MESSAGE("Actor %llx CheckShieldOMOD->AttachMainOMOD", a->formID);
 						break;
 					} else if (HasMod(invitem, omodit->mainOMOD)) {
 						GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
@@ -486,9 +511,10 @@ void CheckShieldOMOD(Actor* a)
 						break;
 					}
 				} else {
+					_DEBUGMESSAGE("CheckShieldOMOD - Is NOT Equipped");
 					if (HasMod(invitem, omodit->mainOMOD)) {
 						AttachGroundOMOD_Internal(a, *omodit, invitem);
-						_MESSAGE("Actor %llx CheckShieldOMOD->AttachGroundOMOD", a);
+						_MESSAGE("Actor %llx CheckShieldOMOD->AttachGroundOMOD", a->formID);
 						break;
 					}
 				}
