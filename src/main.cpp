@@ -490,32 +490,34 @@ void CheckShieldOMOD(Actor* a)
 	bool hasShield = false;
 	_DEBUGMESSAGE("CheckShieldOMOD - Actor %llx", a->formID);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
-		auto sdlookup = GetShieldData(invitem->object->formID);
-		if (sdlookup != shieldDataMap.end()) {
-			_DEBUGMESSAGE("CheckShieldOMOD - Shield %llx", invitem->object->formID);
-			for (auto omodit = sdlookup->second.omods.begin(); omodit != sdlookup->second.omods.end(); ++omodit) {
-				if (invitem->stackData->IsEquipped()) {
-					_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
-					if (HasMod(invitem, omodit->groundOMOD)) {
-						AttachMainOMOD_Internal(a, *omodit, invitem);
-						if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
-							a->SetBaseActorValue(*damageThresholdMul, 1.f);
+		if (invitem->object->formType == ENUM_FORM_ID::kWEAP || invitem->object->formType == ENUM_FORM_ID::kARMO) {
+			auto sdlookup = GetShieldData(invitem->object->formID);
+			if (sdlookup != shieldDataMap.end()) {
+				_DEBUGMESSAGE("CheckShieldOMOD - Shield %llx", invitem->object->formID);
+				for (auto omodit = sdlookup->second.omods.begin(); omodit != sdlookup->second.omods.end(); ++omodit) {
+					if (invitem->stackData->IsEquipped()) {
+						_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
+						if (HasMod(invitem, omodit->groundOMOD)) {
+							AttachMainOMOD_Internal(a, *omodit, invitem);
+							if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
+								a->SetBaseActorValue(*damageThresholdMul, 1.f);
+							}
+							GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
+							hasShield = true;
+							_MESSAGE("Actor %llx CheckShieldOMOD->AttachMainOMOD", a->formID);
+							break;
+						} else if (HasMod(invitem, omodit->mainOMOD)) {
+							GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
+							hasShield = true;
+							break;
 						}
-						GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
-						hasShield = true;
-						_MESSAGE("Actor %llx CheckShieldOMOD->AttachMainOMOD", a->formID);
-						break;
-					} else if (HasMod(invitem, omodit->mainOMOD)) {
-						GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
-						hasShield = true;
-						break;
-					}
-				} else {
-					_DEBUGMESSAGE("CheckShieldOMOD - Is NOT Equipped");
-					if (HasMod(invitem, omodit->mainOMOD)) {
-						AttachGroundOMOD_Internal(a, *omodit, invitem);
-						_MESSAGE("Actor %llx CheckShieldOMOD->AttachGroundOMOD", a->formID);
-						break;
+					} else {
+						_DEBUGMESSAGE("CheckShieldOMOD - Is NOT Equipped");
+						if (HasMod(invitem, omodit->mainOMOD)) {
+							AttachGroundOMOD_Internal(a, *omodit, invitem);
+							_MESSAGE("Actor %llx CheckShieldOMOD->AttachGroundOMOD", a->formID);
+							break;
+						}
 					}
 				}
 			}
@@ -536,12 +538,14 @@ public:
 	{
 		if (!isInWorkbench) {
 			TESForm* item = TESForm::GetFormByID(evn.formId);
-			if (item && item->formType == ENUM_FORM_ID::kWEAP && IsShield(evn.formId)) {
+			if (item && (item->formType == ENUM_FORM_ID::kWEAP || item->formType == ENUM_FORM_ID::kARMO)) {
 				auto sdlookup = GetShieldData(evn.formId);
-				if (evn.isEquip) {
-					AttachMainOMOD(evn.a, evn.formId, sdlookup->second);
-				} else {
-					AttachGroundOMOD(evn.a, evn.formId, sdlookup->second);
+				if (sdlookup != shieldDataMap.end()) {
+					if (evn.isEquip) {
+						AttachMainOMOD(evn.a, evn.formId, sdlookup->second);
+					} else {
+						AttachGroundOMOD(evn.a, evn.formId, sdlookup->second);
+					}
 				}
 			}
 		}
