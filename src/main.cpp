@@ -252,42 +252,45 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 			float dtAdd = a->GetActorValue(*damageThresholdAdd);
 			float dtMul = a->GetActorValue(*damageThresholdMul);
 			if (hitData.impactData.collisionObj) {
-				//_MESSAGE("Projectile check");
+				_DEBUGMESSAGE("HookedDoHitMe - Projectile Check");
 				for (auto partit = od->parts.begin(); partit != od->parts.end(); ++partit) {
 					NiAVObject* parent = hitData.impactData.collisionObj->sceneObject;
 					if (parent && parent->name == partit->partName) {
+						_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (partit->damageThreshold + dtAdd) * dtMul);
 						if (partit->damageThreshold <= 0 || hitData.totalDamage < (partit->damageThreshold + dtAdd) * dtMul) {
 							doDamage = false;
-							//_MESSAGE("Blocked");
 							hitData.SetAllDamageToZero();
+							_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
 							break;
 						}
 					}
 				}
 			} else {
 				if (hitData.attackData) {
-					//_MESSAGE("Melee check");
+					_DEBUGMESSAGE("HookedDoHitMe - Melee Check");
 					TESObjectREFR* attacker = hitData.attackerHandle.get().get();
 					if (attacker && attacker->formType == ENUM_FORM_ID::kACHR) {
 						NiPoint3 eyeAttacker, dirAttacker;
 						((Actor*)attacker)->GetEyeVector(eyeAttacker, dirAttacker, false);
 						NiPoint3 hitDir = Normalize(eyeAttacker - eye);
 						float hitAng = acos(DotProduct(dir, hitDir));
+						_DEBUGMESSAGE("HookedDoHitMe - HitAng %f vs DefAng %f", hitAng, od->defenseAng);
 						if (hitAng <= od->defenseAng) {
+							_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (od->meleeThreshold + dtAdd) * dtMul);
 							if (od->meleeThreshold <= 0 || hitData.totalDamage < (od->meleeThreshold + dtAdd) * dtMul) {
 								doDamage = false;
-								//_MESSAGE("Blocked");
 								hitData.SetAllDamageToZero();
+								_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
 							}
 						}
 					}
 				} else {
 					TESObjectREFR* source = hitData.sourceHandle.get().get();
 					if (source) {
-						//_MESSAGE("Explosive check");
+						_DEBUGMESSAGE("HookedDoHitMe - Explosion Check");
 						NiPoint3 hitDir = Normalize(source->data.location - eye);
 						float hitAng = acos(DotProduct(dir, hitDir));
-						//_MESSAGE("hitAng %f defAng %f", hitAng, od->defenseAng);
+						_DEBUGMESSAGE("HookedDoHitMe - HitAng %f vs DefAng %f", hitAng, od->defenseAng);
 						if (hitAng <= od->defenseAng) {
 							BGSProjectile* baseProj = hitData.ammo ? hitData.ammo->data.projectile : nullptr;
 							TESObjectWEAP* weap = (TESObjectWEAP*)hitData.source.object;
@@ -306,10 +309,11 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 								}
 							}
 							if ((baseProj && baseProj->data.explosionType) || source->GetObjectReference()->formType == ENUM_FORM_ID::kEXPL) {
+								_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (od->explosionThreshold + dtAdd) * dtMul);
 								if (od->explosionThreshold <= 0 || hitData.totalDamage < (od->explosionThreshold + dtAdd) * dtMul) {
 									doDamage = false;
-									//_MESSAGE("Blocked");
 									hitData.SetAllDamageToZero();
+									_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
 								}
 							}
 						}
@@ -445,6 +449,9 @@ void AttachMainOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 						AttachMainOMOD_Internal(a, *omodit, invitem);
 						if (a == pc) {
 							SetMainOMODLooseMod(*omodit);
+						}
+						if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
+							a->SetBaseActorValue(*damageThresholdMul, 1.f);
 						}
 						a->SetBaseActorValue(*shieldHolder, 1.f);
 						omodDataCache.insert(std::pair<uint32_t, OMODData>(a->formID, *omodit));
