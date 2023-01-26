@@ -440,23 +440,25 @@ void AttachMainOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 	}
 	_DEBUGMESSAGE("AttachMainOMOD - Actor %llx formID %llx", a->formID, formId);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
-		if (invitem->object->formID == formId) {
-			_DEBUGMESSAGE("AttachMainOMOD - Found item in inventory");
-			if (invitem->stackData->IsEquipped()) {
-				_DEBUGMESSAGE("AttachMainOMOD - Is Equipped");
-				for (auto omodit = sd.omods.begin(); omodit != sd.omods.end(); ++omodit) {
-					if (HasMod(invitem, omodit->groundOMOD)) {
-						AttachMainOMOD_Internal(a, *omodit, invitem);
-						if (a == pc) {
-							SetMainOMODLooseMod(*omodit);
+		if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
+			if (invitem->object->formID == formId) {
+				_DEBUGMESSAGE("AttachMainOMOD - Found item in inventory");
+				if (invitem->stackData->IsEquipped()) {
+					_DEBUGMESSAGE("AttachMainOMOD - Is Equipped");
+					for (auto omodit = sd.omods.begin(); omodit != sd.omods.end(); ++omodit) {
+						if (HasMod(invitem, omodit->groundOMOD)) {
+							AttachMainOMOD_Internal(a, *omodit, invitem);
+							if (a == pc) {
+								SetMainOMODLooseMod(*omodit);
+							}
+							if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
+								a->SetBaseActorValue(*damageThresholdMul, 1.f);
+							}
+							a->SetBaseActorValue(*shieldHolder, 1.f);
+							omodDataCache.insert(std::pair<uint32_t, OMODData>(a->formID, *omodit));
+							_MESSAGE("Actor %llx Equip->AttachMainOMOD", a->formID);
+							return;
 						}
-						if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
-							a->SetBaseActorValue(*damageThresholdMul, 1.f);
-						}
-						a->SetBaseActorValue(*shieldHolder, 1.f);
-						omodDataCache.insert(std::pair<uint32_t, OMODData>(a->formID, *omodit));
-						_MESSAGE("Actor %llx Equip->AttachMainOMOD", a->formID);
-						return;
 					}
 				}
 			}
@@ -471,18 +473,20 @@ void AttachGroundOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 	}
 	_DEBUGMESSAGE("AttachGroundOMOD - Actor %llx formID %llx", a->formID, formId);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
-		if (invitem->object->formID == formId) {
-			_DEBUGMESSAGE("AttachGroundOMOD - Found item in inventory");
-			for (auto omodit = sd.omods.begin(); omodit != sd.omods.end(); ++omodit) {
-				if (HasMod(invitem, omodit->mainOMOD)) {
-					AttachGroundOMOD_Internal(a, *omodit, invitem);
-					if (a == pc) {
-						SetGroundOMODLooseMod(*omodit);
+		if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
+			if (invitem->object->formID == formId) {
+				_DEBUGMESSAGE("AttachGroundOMOD - Found item in inventory");
+				for (auto omodit = sd.omods.begin(); omodit != sd.omods.end(); ++omodit) {
+					if (HasMod(invitem, omodit->mainOMOD)) {
+						AttachGroundOMOD_Internal(a, *omodit, invitem);
+						if (a == pc) {
+							SetGroundOMODLooseMod(*omodit);
+						}
+						a->SetBaseActorValue(*shieldHolder, 0.f);
+						omodDataCache.erase(a->formID);
+						_MESSAGE("Actor %llx Unequip->AttachGroundOMOD", a->formID);
+						return;
 					}
-					a->SetBaseActorValue(*shieldHolder, 0.f);
-					omodDataCache.erase(a->formID);
-					_MESSAGE("Actor %llx Unequip->AttachGroundOMOD", a->formID);
-					return;
 				}
 			}
 		}
@@ -497,7 +501,7 @@ void CheckShieldOMOD(Actor* a)
 	bool hasShield = false;
 	_DEBUGMESSAGE("CheckShieldOMOD - Actor %llx", a->formID);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
-		if (invitem->object->formType == ENUM_FORM_ID::kWEAP || invitem->object->formType == ENUM_FORM_ID::kARMO) {
+		if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
 			auto sdlookup = GetShieldData(invitem->object->formID);
 			if (sdlookup != shieldDataMap.end()) {
 				_DEBUGMESSAGE("CheckShieldOMOD - Shield %llx", invitem->object->formID);
@@ -516,6 +520,7 @@ void CheckShieldOMOD(Actor* a)
 						} else if (HasMod(invitem, omodit->mainOMOD)) {
 							GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
 							hasShield = true;
+							_DEBUGMESSAGE("CheckShieldOMOD - Shield already has mainOMOD");
 							break;
 						}
 					} else {
@@ -536,6 +541,7 @@ void CheckShieldOMOD(Actor* a)
 		a->SetBaseActorValue(*shieldHolder, 0.f);
 		omodDataCache.erase(a->formID);
 	}
+	_DEBUGMESSAGE("CheckShieldOMOD - Shield Holder %f", a->GetActorValue(*shieldHolder));
 }
 
 class EquipWatcher : public BSTEventSink<TESEquipEvent>
@@ -545,7 +551,7 @@ public:
 	{
 		if (!isInWorkbench) {
 			TESForm* item = TESForm::GetFormByID(evn.formId);
-			if (item && (item->formType == ENUM_FORM_ID::kWEAP || item->formType == ENUM_FORM_ID::kARMO)) {
+			if (item && (item->formType == ENUM_FORM_ID::kWEAP)) {
 				auto sdlookup = GetShieldData(evn.formId);
 				if (sdlookup != shieldDataMap.end()) {
 					if (evn.isEquip) {
@@ -602,16 +608,20 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 				isInWorkbench = true;
 				if (pc->inventoryList) {
 					for (auto invitem = pc->inventoryList->data.begin(); invitem != pc->inventoryList->data.end(); ++invitem) {
-						auto sdlookup = GetShieldData(invitem->object->formID);
-						if (sdlookup != shieldDataMap.end()) {
-							OMODData* od = GetCurrentOMODData(pc);
-							if (!od) {
-								_MESSAGE("ExamineMenu - Actor formID %llx Shield form ID %llx Couldn't retrieve OMODData!", pc->formID, sdlookup->first);
-							} else {
-								if (invitem->stackData->IsEquipped()) {
-									if (HasMod(invitem, od->mainOMOD)) {
-										AttachGroundOMOD_Internal(pc, *od, invitem);
-										SetGroundOMODLooseMod(*od);
+						if (invitem->stackData->IsEquipped()) {
+							if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
+								auto sdlookup = GetShieldData(invitem->object->formID);
+								if (sdlookup != shieldDataMap.end()) {
+									OMODData* od = GetCurrentOMODData(pc);
+									if (!od) {
+										_MESSAGE("ExamineMenu - Actor formID %llx Shield form ID %llx Couldn't retrieve OMODData!", pc->formID, sdlookup->first);
+									} else {
+										if (invitem->stackData->IsEquipped()) {
+											if (HasMod(invitem, od->mainOMOD)) {
+												AttachGroundOMOD_Internal(pc, *od, invitem);
+												SetGroundOMODLooseMod(*od);
+											}
+										}
 									}
 								}
 							}
