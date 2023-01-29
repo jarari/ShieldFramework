@@ -20,7 +20,10 @@ struct PartData
 {
 	std::string partName = "";
 	BGSMaterialType* material = nullptr;
-	SpellItem* spell = nullptr;
+	SpellItem* spell_victim = nullptr;
+	SpellItem* spell_attacker = nullptr;
+	SpellItem* spell_blocked_victim = nullptr;
+	SpellItem* spell_blocked_attacker = nullptr;
 	TESImageSpaceModifier* imod = nullptr;
 	float damageThreshold = 0.f;
 	float shakeDuration = 0.f;
@@ -231,6 +234,8 @@ OMODData* GetCurrentOMODData(Actor* a)
 void HookedDoHitMe(Actor* a, HitData& hitData)
 {
 	bool doDamage = true;
+	bool hasCollObj = false;
+	std::vector<PartData>::iterator blockedPart;
 	auto sdlookup = GetShieldData(a);
 	if (a->GetActorValue(*shieldHolder) != 0 && sdlookup != shieldDataMap.end()) {
 #ifdef DEBUG
@@ -257,7 +262,9 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 					NiAVObject* parent = hitData.impactData.collisionObj->sceneObject;
 					if (parent && parent->name == partit->partName) {
 						_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (partit->damageThreshold + dtAdd) * dtMul);
-						if (partit->damageThreshold <= 0 || hitData.totalDamage < (partit->damageThreshold + dtAdd) * dtMul) {
+						hasCollObj = true;
+						blockedPart = partit;
+						if (partit->damageThreshold < 0 || hitData.totalDamage < (partit->damageThreshold + dtAdd) * dtMul) {
 							doDamage = false;
 							hitData.SetAllDamageToZero();
 							_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
@@ -277,7 +284,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 						_DEBUGMESSAGE("HookedDoHitMe - HitAng %f vs DefAng %f", hitAng, od->defenseAng);
 						if (hitAng <= od->defenseAng) {
 							_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (od->meleeThreshold + dtAdd) * dtMul);
-							if (od->meleeThreshold <= 0 || hitData.totalDamage < (od->meleeThreshold + dtAdd) * dtMul) {
+							if (od->meleeThreshold < 0 || hitData.totalDamage < (od->meleeThreshold + dtAdd) * dtMul) {
 								doDamage = false;
 								hitData.SetAllDamageToZero();
 								_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
@@ -310,7 +317,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 							}
 							if ((baseProj && baseProj->data.explosionType) || source->GetObjectReference()->formType == ENUM_FORM_ID::kEXPL) {
 								_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (od->explosionThreshold + dtAdd) * dtMul);
-								if (od->explosionThreshold <= 0 || hitData.totalDamage < (od->explosionThreshold + dtAdd) * dtMul) {
+								if (od->explosionThreshold < 0 || hitData.totalDamage < (od->explosionThreshold + dtAdd) * dtMul) {
 									doDamage = false;
 									hitData.SetAllDamageToZero();
 									_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
@@ -318,6 +325,32 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 							}
 						}
 					}
+				}
+			}
+		}
+	}
+	if (hasCollObj) {
+		TESObjectREFR* attacker = hitData.attackerHandle.get().get();
+		if (doDamage) {
+			if (blockedPart->spell_victim) {
+				_DEBUGMESSAGE("HookedDoHitMe - Casting spell on victim (Non-block)");
+				blockedPart->spell_victim->Cast(a, a, a, GameVM::GetSingleton()->GetVM().get());
+			}
+			if (blockedPart->spell_attacker) {
+				if (attacker && attacker->formType == ENUM_FORM_ID::kACHR) {
+					_DEBUGMESSAGE("HookedDoHitMe - Casting spell on attacker (Non-block)");
+					blockedPart->spell_attacker->Cast(a, attacker, (Actor*)attacker, GameVM::GetSingleton()->GetVM().get());
+				}
+			}
+		} else {
+			if (blockedPart->spell_blocked_victim) {
+				_DEBUGMESSAGE("HookedDoHitMe - Casting spell on victim (Blocked)");
+				blockedPart->spell_blocked_victim->Cast(a, a, a, GameVM::GetSingleton()->GetVM().get());
+			}
+			if (blockedPart->spell_blocked_attacker) {
+				if (attacker && attacker->formType == ENUM_FORM_ID::kACHR) {
+					_DEBUGMESSAGE("HookedDoHitMe - Casting spell on attacker (Blocked)");
+					blockedPart->spell_blocked_attacker->Cast(a, attacker, (Actor*)attacker, GameVM::GetSingleton()->GetVM().get());
 				}
 			}
 		}
@@ -513,12 +546,14 @@ void CheckShieldOMOD(Actor* a)
 							if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
 								a->SetBaseActorValue(*damageThresholdMul, 1.f);
 							}
-							GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
+							GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
 							hasShield = true;
 							_MESSAGE("Actor %llx CheckShieldOMOD->AttachMainOMOD", a->formID);
 							break;
 						} else if (HasMod(invitem, omodit->mainOMOD)) {
-							GameScript::PostModifyInventoryItemMod(a, invitem->object, true);
+							if (!CheckPA(a)) {
+								GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
+							}
 							hasShield = true;
 							_DEBUGMESSAGE("CheckShieldOMOD - Shield already has mainOMOD");
 							break;
@@ -604,22 +639,24 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 			}
 			CheckShieldOMOD(pc);
 		} else if (evn.menuName == BSFixedString("ExamineMenu")) {
-			if (evn.opening) {
-				isInWorkbench = true;
-				if (pc->inventoryList) {
-					for (auto invitem = pc->inventoryList->data.begin(); invitem != pc->inventoryList->data.end(); ++invitem) {
-						if (invitem->stackData->IsEquipped()) {
-							if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
-								auto sdlookup = GetShieldData(invitem->object->formID);
-								if (sdlookup != shieldDataMap.end()) {
-									OMODData* od = GetCurrentOMODData(pc);
-									if (!od) {
-										_MESSAGE("ExamineMenu - Actor formID %llx Shield form ID %llx Couldn't retrieve OMODData!", pc->formID, sdlookup->first);
-									} else {
-										if (invitem->stackData->IsEquipped()) {
-											if (HasMod(invitem, od->mainOMOD)) {
-												AttachGroundOMOD_Internal(pc, *od, invitem);
-												SetGroundOMODLooseMod(*od);
+			if (pc->interactingState != INTERACTING_STATE::kNotInteracting) {
+				if (evn.opening) {
+					isInWorkbench = true;
+					if (pc->inventoryList) {
+						for (auto invitem = pc->inventoryList->data.begin(); invitem != pc->inventoryList->data.end(); ++invitem) {
+							if (invitem->stackData->IsEquipped()) {
+								if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
+									auto sdlookup = GetShieldData(invitem->object->formID);
+									if (sdlookup != shieldDataMap.end()) {
+										OMODData* od = GetCurrentOMODData(pc);
+										if (!od) {
+											_MESSAGE("ExamineMenu - Actor formID %llx Shield form ID %llx Couldn't retrieve OMODData!", pc->formID, sdlookup->first);
+										} else {
+											if (invitem->stackData->IsEquipped()) {
+												if (HasMod(invitem, od->mainOMOD)) {
+													AttachGroundOMOD_Internal(pc, *od, invitem);
+													SetGroundOMODLooseMod(*od);
+												}
 											}
 										}
 									}
@@ -627,12 +664,12 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 							}
 						}
 					}
+					_MESSAGE("ExamineMenu open");
+				} else {
+					isInWorkbench = false;
+					CheckShieldOMOD(pc);
+					_MESSAGE("ExamineMenu close");
 				}
-				_MESSAGE("ExamineMenu open");
-			} else {
-				isInWorkbench = false;
-				CheckShieldOMOD(pc);
-				_MESSAGE("ExamineMenu close");
 			}
 		}
 		return BSEventNotifyControl::kContinue;
@@ -666,9 +703,6 @@ public:
 						if (parent && parent->name == partit->partName) {
 							if (partit->material) {
 								it->materialType = partit->material;
-							}
-							if (partit->spell) {
-								partit->spell->Cast(this->shooter.get().get(), a, a, GameVM::GetSingleton()->GetVM().get());
 							}
 							if (a == pc) {
 								if (partit->imod) {
@@ -794,17 +828,59 @@ void InitializeShieldData()
 													_MESSAGE("MaterialType %s not found", lookup.value().get<std::string>().c_str());
 												}
 											}
-											lookup = (*partit).find("Spell");
+											lookup = (*partit).find("SpellShielder");
 											if (lookup != (*partit).end()) {
 												std::string spellFormIDstr;
 												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
 												if (spellFormIDstr.length() > 0) {
 													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
 													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
-														pd.spell = (SpellItem*)result;
-														_MESSAGE("Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+														pd.spell_victim = (SpellItem*)result;
+														_MESSAGE("SpellShielder - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
 													} else {
-														_MESSAGE("Spell %s not found", lookup.value().get<std::string>().c_str());
+														_MESSAGE("SpellShielder - Spell %s not found", lookup.value().get<std::string>().c_str());
+													}
+												}
+											}
+											lookup = (*partit).find("SpellAttacker");
+											if (lookup != (*partit).end()) {
+												std::string spellFormIDstr;
+												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+												if (spellFormIDstr.length() > 0) {
+													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+														pd.spell_attacker = (SpellItem*)result;
+														_MESSAGE("SpellAttacker - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+													} else {
+														_MESSAGE("SpellAttacker - Spell %s not found", lookup.value().get<std::string>().c_str());
+													}
+												}
+											}
+											lookup = (*partit).find("SpellShielderOnBlock");
+											if (lookup != (*partit).end()) {
+												std::string spellFormIDstr;
+												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+												if (spellFormIDstr.length() > 0) {
+													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+														pd.spell_blocked_victim = (SpellItem*)result;
+														_MESSAGE("SpellShielderOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+													} else {
+														_MESSAGE("SpellShielderOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
+													}
+												}
+											}
+											lookup = (*partit).find("SpellAttackerOnBlock");
+											if (lookup != (*partit).end()) {
+												std::string spellFormIDstr;
+												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+												if (spellFormIDstr.length() > 0) {
+													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+														pd.spell_blocked_attacker = (SpellItem*)result;
+														_MESSAGE("SpellAttackerOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+													} else {
+														_MESSAGE("SpellAttackerOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
 													}
 												}
 											}
