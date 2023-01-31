@@ -5,7 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
-//#define DEBUG
+#define DEBUG
 
 #ifdef DEBUG
 #define _DEBUGMESSAGE(fmt, ...) _MESSAGE(fmt __VA_OPT__(, ) __VA_ARGS__)
@@ -35,27 +35,27 @@ struct OMODData
 	vector<PartData> parts;
 	BGSMod::Attachment::Mod* mainOMOD = nullptr;
 	BGSMod::Attachment::Mod* groundOMOD = nullptr;
-	float meleeThreshold = 0.f;
-	float explosionThreshold = 0.f;
-	float defenseAng = 45.f;
 };
 
 struct ShieldData
 {
 	vector<OMODData> omods;
+	bool isWeapon = false;
 };
 
 ptrdiff_t ProcessProjectileFX_PatchOffset = 0x1A1;
 REL::Relocation<uintptr_t> ProcessProjectileFX{ REL::ID(806412), ProcessProjectileFX_PatchOffset };
 REL::Relocation<uintptr_t> ptr_DoHitMe{ REL::ID(1546751), 0x921 };
 REL::Relocation<uintptr_t> ptr_UpdateSceneGraph{ REL::ID(1318162), 0xD5 };
+REL::Relocation<uintptr_t> ptr_Demand3D{ REL::ID(736753), 0xB4 };
 static uintptr_t DoHitMeOrig;
 static uintptr_t UpdateSceneGraphOrig;
+static uintptr_t Demand3DOrig;
 static unordered_map<uint32_t, ShieldData> shieldDataMap;
-static unordered_map<uint32_t, OMODData> omodDataCache;
+static unordered_map<uint32_t, OMODData> omodDataCache;	 //Used for weapons only
 static ActorValueInfo* damageThresholdAdd;
 static ActorValueInfo* damageThresholdMul;
-static ActorValueInfo* shieldHolder;
+static BGSProjectile* colCheckProj;
 static PlayerCharacter* pc;
 static PlayerCamera* pcam;
 
@@ -171,20 +171,35 @@ unordered_map<uint32_t, ShieldData>::iterator GetShieldData(uint32_t formID)
 	return shieldDataMap.end();
 }
 
-unordered_map<uint32_t, ShieldData>::iterator GetShieldData(Actor* a)
+std::vector<unordered_map<uint32_t, ShieldData>::iterator> GetEquippedShieldDataList(Actor* a)
 {
-	if (!a || !a->currentProcess || !a->currentProcess->middleHigh || !a->Get3D())
-		return shieldDataMap.end();
+	std::vector<unordered_map<uint32_t, ShieldData>::iterator> shieldList;
+	if (!a || !a->inventoryList)
+		return shieldList;
 
-	BSTArray<EquippedItem> equipped = a->currentProcess->middleHigh->equippedItems;
-	for (auto eqit = equipped.begin(); eqit != equipped.end(); ++eqit) {
-		uint32_t eqipid = eqit->item.object->formID;
-		auto sdlookup = shieldDataMap.find(eqipid);
-		if (sdlookup != shieldDataMap.end()) {
-			return sdlookup;
+	_DEBUGMESSAGE("GetEquippedShieldDataList - Checking Actor formID %llx", a->formID);
+	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
+		if (invitem->stackData->IsEquipped()) {
+			if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
+				auto sdlookup = GetShieldData(invitem->object->formID);
+				if (sdlookup != shieldDataMap.end()) {
+					for (auto omodit = sdlookup->second.omods.begin(); omodit != sdlookup->second.omods.end(); ++omodit) {
+						if (HasMod(invitem, omodit->mainOMOD)) {
+							shieldList.push_back(sdlookup);
+							_DEBUGMESSAGE("GetEquippedShieldDataList - Equipped weapon %llx with omod %llx found", invitem->object->formID, omodit->mainOMOD->formID);
+						}
+					}
+				}
+			} else if (invitem->object->formType == ENUM_FORM_ID::kARMO) {
+				auto sdlookup = GetShieldData(invitem->object->formID);
+				if (sdlookup != shieldDataMap.end()) {
+					shieldList.push_back(sdlookup);
+					_DEBUGMESSAGE("GetEquippedShieldDataList - Equipped armor %llx found", invitem->object->formID);
+				}
+			}
 		}
 	}
-	return shieldDataMap.end();
+	return shieldList;
 }
 
 bool IsShield(uint32_t formID)
@@ -200,19 +215,22 @@ void CacheOMODData(Actor* a)
 	if (!a->inventoryList) {
 		return;
 	}
+	_DEBUGMESSAGE("CacheOMODData - Checking Actor formID %llx", a->formID);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
-		auto sdlookup = GetShieldData(invitem->object->formID);
-		if (sdlookup != shieldDataMap.end()) {
-			if (invitem->stackData->IsEquipped()) {
+		if (invitem->stackData->IsEquipped() && invitem->object->formType == ENUM_FORM_ID::kWEAP) {
+			auto sdlookup = GetShieldData(invitem->object->formID);
+			if (sdlookup != shieldDataMap.end()) {
 				for (auto omodit = sdlookup->second.omods.begin(); omodit != sdlookup->second.omods.end(); ++omodit) {
 					if (HasMod(invitem, omodit->mainOMOD)) {
 						omodDataCache.insert(std::pair<uint32_t, OMODData>(a->formID, *omodit));
+						_DEBUGMESSAGE("CacheOMODData - Cached weapon %llx with omod %llx", invitem->object->formID, omodit->mainOMOD->formID);
 						return;
 					}
 				}
 			}
 		}
 	}
+	_DEBUGMESSAGE("CacheOMODData - No weapon with shield found");
 	omodDataCache.erase(a->formID);
 }
 
@@ -236,24 +254,29 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 	bool doDamage = true;
 	bool hasCollObj = false;
 	std::vector<PartData>::iterator blockedPart;
-	auto sdlookup = GetShieldData(a);
-	if (a->GetActorValue(*shieldHolder) != 0 && sdlookup != shieldDataMap.end()) {
+	auto sdlist = GetEquippedShieldDataList(a);
+	for (auto sdlookup = sdlist.begin(); sdlookup != sdlist.end(); ++sdlookup) {
 #ifdef DEBUG
-		_DEBUGMESSAGE("HookedDoHitMe - ShieldHolder %llx hit with dmg %f", a->formID, hitData.totalDamage);
-		if (hitData.impactData.collisionObj && hitData.impactData.collisionObj->sceneObject) {
-			_DEBUGMESSAGE("HookedDoHitMe - Collision object %s at %llx", hitData.impactData.collisionObj->sceneObject->name.c_str(), hitData.impactData.collisionObj->sceneObject);
-		}
-		if (hitData.sourceHandle.get().get()) {
-			_DEBUGMESSAGE("HookedDoHitMe - Source formID %llx at %llx", hitData.sourceHandle.get()->formID, hitData.sourceHandle.get().get());
+		if (sdlookup == sdlist.begin()) {
+			_DEBUGMESSAGE("HookedDoHitMe - ShieldHolder %llx hit with dmg %f", a->formID, hitData.totalDamage);
+			if (hitData.impactData.collisionObj && hitData.impactData.collisionObj->sceneObject) {
+				_DEBUGMESSAGE("HookedDoHitMe - Collision object %s at %llx", hitData.impactData.collisionObj->sceneObject->name.c_str(), hitData.impactData.collisionObj->sceneObject);
+			}
+			if (hitData.sourceHandle.get().get()) {
+				_DEBUGMESSAGE("HookedDoHitMe - Source formID %llx at %llx", hitData.sourceHandle.get()->formID, hitData.sourceHandle.get().get());
+			}
 		}
 #endif
-		OMODData* od = GetCurrentOMODData(a);
+		OMODData* od = nullptr;
+		if ((*sdlookup)->second.isWeapon) {
+			od = GetCurrentOMODData(a);
+		} else {
+			od = &(*sdlookup)->second.omods.at(0);
+		}
 		//_MESSAGE("Actor %llx hit with dmg %f from %llx", a, hitData.totalDamage, hitData.source.object);
 		if (!od) {
-			_MESSAGE("HookedDoHitMe - Actor formID %llx Shield form ID %llx Couldn't retrieve OMODData!", a->formID, sdlookup->first);
+			_MESSAGE("HookedDoHitMe - Actor formID %llx Couldn't retrieve OMODData!", a->formID);
 		} else {
-			NiPoint3 eye, dir;
-			a->GetEyeVector(eye, dir, false);
 			float dtAdd = a->GetActorValue(*damageThresholdAdd);
 			float dtMul = a->GetActorValue(*damageThresholdMul);
 			if (hitData.impactData.collisionObj) {
@@ -277,17 +300,31 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 					_DEBUGMESSAGE("HookedDoHitMe - Melee Check");
 					TESObjectREFR* attacker = hitData.attackerHandle.get().get();
 					if (attacker && attacker->formType == ENUM_FORM_ID::kACHR) {
-						NiPoint3 eyeAttacker, dirAttacker;
-						((Actor*)attacker)->GetEyeVector(eyeAttacker, dirAttacker, false);
-						NiPoint3 hitDir = Normalize(eyeAttacker - eye);
-						float hitAng = acos(DotProduct(dir, hitDir));
-						_DEBUGMESSAGE("HookedDoHitMe - HitAng %f vs DefAng %f", hitAng, od->defenseAng);
-						if (hitAng <= od->defenseAng) {
-							_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (od->meleeThreshold + dtAdd) * dtMul);
-							if (od->meleeThreshold < 0 || hitData.totalDamage < (od->meleeThreshold + dtAdd) * dtMul) {
-								doDamage = false;
-								hitData.SetAllDamageToZero();
-								_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
+						NiPoint3 eyeAttacker, dirAttacker, attackerCenter;
+						((ActorEx*)attacker)->GetEyeVector(eyeAttacker, dirAttacker, false);
+						((TESObjectREFREx*)attacker)->GetObjectCenter(attackerCenter);
+						F4::bhkPickData pick = F4::bhkPickData();
+						dirAttacker.z = 0;
+						dirAttacker = Normalize(dirAttacker);
+						GetPickData(attackerCenter + dirAttacker * 30.f, attackerCenter + dirAttacker * 1000.f, (Actor*)attacker, colCheckProj, pick);
+						if (pick.HasHit()) {
+							NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60), *(float*)((uintptr_t)&pick + 0x64), *(float*)((uintptr_t)&pick + 0x68)) / *ptr_fBS2HkScale;
+							NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, dirAttacker);
+							_DEBUGMESSAGE("HookedDoHitMe - Closest Bone %llx (%s)", closestBone, closestBone->name.c_str());
+							if (closestBone) {
+								for (auto partit = od->parts.begin(); partit != od->parts.end(); ++partit) {
+									if (closestBone->name == partit->partName) {
+										_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (partit->damageThreshold + dtAdd) * dtMul);
+										hasCollObj = true;
+										blockedPart = partit;
+										if (partit->damageThreshold < 0 || hitData.totalDamage < (partit->damageThreshold + dtAdd) * dtMul) {
+											doDamage = false;
+											hitData.SetAllDamageToZero();
+											_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
+											break;
+										}
+									}
+								}
 							}
 						}
 					}
@@ -295,32 +332,46 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 					TESObjectREFR* source = hitData.sourceHandle.get().get();
 					if (source) {
 						_DEBUGMESSAGE("HookedDoHitMe - Explosion Check");
-						NiPoint3 hitDir = Normalize(source->data.location - eye);
-						float hitAng = acos(DotProduct(dir, hitDir));
-						_DEBUGMESSAGE("HookedDoHitMe - HitAng %f vs DefAng %f", hitAng, od->defenseAng);
-						if (hitAng <= od->defenseAng) {
-							BGSProjectile* baseProj = hitData.ammo ? hitData.ammo->data.projectile : nullptr;
-							TESObjectWEAP* weap = (TESObjectWEAP*)hitData.source.object;
-							TESObjectWEAP::InstanceData* weapInstance = (TESObjectWEAP::InstanceData*)hitData.source.instanceData.get();
-							if (weapInstance) {
-								if (weapInstance->rangedData && weapInstance->rangedData->overrideProjectile) {
-									baseProj = weapInstance->rangedData->overrideProjectile;
-								} else if (weapInstance->ammo && weapInstance->ammo->data.projectile) {
-									baseProj = weapInstance->ammo->data.projectile;
-								}
-							} else if (weap) {
-								if (weap->weaponData.rangedData && weap->weaponData.rangedData->overrideProjectile) {
-									baseProj = weap->weaponData.rangedData->overrideProjectile;
-								} else if (weap->weaponData.ammo && weap->weaponData.ammo->data.projectile) {
-									baseProj = weap->weaponData.ammo->data.projectile;
-								}
+						BGSProjectile* baseProj = hitData.ammo ? hitData.ammo->data.projectile : nullptr;
+						TESObjectWEAP* weap = (TESObjectWEAP*)hitData.source.object;
+						TESObjectWEAP::InstanceData* weapInstance = (TESObjectWEAP::InstanceData*)hitData.source.instanceData.get();
+						if (weapInstance) {
+							if (weapInstance->rangedData && weapInstance->rangedData->overrideProjectile) {
+								baseProj = weapInstance->rangedData->overrideProjectile;
+							} else if (weapInstance->ammo && weapInstance->ammo->data.projectile) {
+								baseProj = weapInstance->ammo->data.projectile;
 							}
-							if ((baseProj && baseProj->data.explosionType) || source->GetObjectReference()->formType == ENUM_FORM_ID::kEXPL) {
-								_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (od->explosionThreshold + dtAdd) * dtMul);
-								if (od->explosionThreshold < 0 || hitData.totalDamage < (od->explosionThreshold + dtAdd) * dtMul) {
-									doDamage = false;
-									hitData.SetAllDamageToZero();
-									_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
+						} else if (weap) {
+							if (weap->weaponData.rangedData && weap->weaponData.rangedData->overrideProjectile) {
+								baseProj = weap->weaponData.rangedData->overrideProjectile;
+							} else if (weap->weaponData.ammo && weap->weaponData.ammo->data.projectile) {
+								baseProj = weap->weaponData.ammo->data.projectile;
+							}
+						}
+						if ((baseProj && baseProj->data.explosionType) || source->GetObjectReference()->formType == ENUM_FORM_ID::kEXPL) {
+							NiPoint3 actorCenter;
+							((TESObjectREFREx*)a)->GetObjectCenter(actorCenter);
+							F4::bhkPickData pick = F4::bhkPickData();
+							NiPoint3 expDir = Normalize(NiPoint3(actorCenter - source->data.location));
+							GetPickData(source->data.location + expDir * 30.f, source->data.location + expDir * 5000.f, a, colCheckProj, pick, false);
+							if (pick.HasHit()) {
+								NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60), *(float*)((uintptr_t)&pick + 0x64), *(float*)((uintptr_t)&pick + 0x68)) / *ptr_fBS2HkScale;
+								NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, expDir);
+								_DEBUGMESSAGE("HookedDoHitMe - Closest Bone %llx (%s)", closestBone, closestBone->name.c_str());
+								if (closestBone) {
+									for (auto partit = od->parts.begin(); partit != od->parts.end(); ++partit) {
+										if (closestBone->name == partit->partName) {
+											_DEBUGMESSAGE("HookedDoHitMe - Threshold %f", (partit->damageThreshold + dtAdd) * dtMul);
+											hasCollObj = true;
+											blockedPart = partit;
+											if (partit->damageThreshold < 0 || hitData.totalDamage < (partit->damageThreshold + dtAdd) * dtMul) {
+												doDamage = false;
+												hitData.SetAllDamageToZero();
+												_DEBUGMESSAGE("HookedDoHitMe - Damage blocked");
+												break;
+											}
+										}
+									}
 								}
 							}
 						}
@@ -366,44 +417,68 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 void HookedUpdateSceneGraph(PlayerCharacter* p)
 {
 	if (p->Get3D(true) == p->Get3D()) {
-		if (GetShieldData(p) != shieldDataMap.end()) {
-			NiAVObject* fpNode = p->Get3D(true);
-			NiAVObject* tpNode = p->Get3D(false);
-			//tpNode->SetAppCulled(false);
-			NiNode* camera = (NiNode*)fpNode->GetObjectByName("Camera");
-			Visit(tpNode, [&](NiAVObject* obj) {
-				if (obj->name.length() != 0) {
-					NiAVObject* found = fpNode->GetObjectByName(obj->name);
-					if (found) {
-						if (obj->name == "Chest") {
-							NiPoint3 fpdiff = found->world.translate - camera->world.translate;
+		NiAVObject* fpNode = p->Get3D(true);
+		NiAVObject* tpNode = p->Get3D(false);
+#ifdef DEBUG
+		tpNode->SetAppCulled(false);
+#endif
+		NiNode* camera = (NiNode*)fpNode->GetObjectByName("Camera");
+		Visit(tpNode, [&](NiAVObject* obj) {
+			if (obj->name.length() != 0) {
+				NiAVObject* found = fpNode->GetObjectByName(obj->name);
+				if (found) {
+					if (obj->name == "Chest") {
+						NiPoint3 fpdiff = found->world.translate - camera->world.translate;
+						obj->local.rotate = found->world.rotate * Transpose(obj->parent->world.rotate);
+						obj->local.translate = obj->parent->world.rotate * (*F4::ptr_kCurrentWorldLoc + fpdiff - obj->parent->world.translate);
+						NiUpdateData ud = NiUpdateData();
+						ud.unk10 = 0x303;
+						obj->UpdateTransforms(ud);
+					} else if (animatedBones.find(std::string(obj->name)) != animatedBones.end()) {
+						if (obj->parent && found->parent) {
 							obj->local.rotate = found->world.rotate * Transpose(obj->parent->world.rotate);
-							obj->local.translate = obj->parent->world.rotate * (*F4::ptr_kCurrentWorldLoc + fpdiff - obj->parent->world.translate);
-							NiUpdateData ud = NiUpdateData();
-							ud.unk10 = 0x303;
-							obj->UpdateTransforms(ud);
-						} else if (animatedBones.find(std::string(obj->name)) != animatedBones.end()) {
-							if (obj->parent && found->parent) {
-								obj->local.rotate = found->world.rotate * Transpose(obj->parent->world.rotate);
-								obj->local.translate = obj->parent->world.rotate * (found->world.translate - found->parent->world.translate);
-							} else {
-								obj->local.rotate = found->local.rotate;
-								obj->local.translate = found->local.translate;
-							}
-							NiUpdateData ud = NiUpdateData();
-							ud.unk10 = 0x303;
-							obj->UpdateTransforms(ud);
+							obj->local.translate = obj->parent->world.rotate * (found->world.translate - found->parent->world.translate);
+						} else {
+							obj->local.rotate = found->local.rotate;
+							obj->local.translate = found->local.translate;
 						}
+						NiUpdateData ud = NiUpdateData();
+						ud.unk10 = 0x303;
+						obj->UpdateTransforms(ud);
 					}
 				}
-				return false;
-			});
-		}
+			}
+			return false;
+		});
 	}
 	typedef bool (*FnUpdateSceneGraph)(PlayerCharacter*);
 	FnUpdateSceneGraph fn = (FnUpdateSceneGraph)UpdateSceneGraphOrig;
 	if (fn)
 		fn(p);
+}
+
+NiAVObject* HookedOMODDemand3D(BGSMod::Attachment::Mod* mod, uintptr_t loadData, bool isFP, bool highres)
+{
+	if (mod->targetFormType == ENUM_FORM_ID::kARMO) {
+		_DEBUGMESSAGE("HookedOMODDemand3D - Armor OMOD formID %llx is requesting 3D", mod->formID);
+		TESObjectREFR* ref = *(TESObjectREFR**)(loadData + 0x330);
+		if (ref && ref->data.objectReference) {
+			_DEBUGMESSAGE("HookedOMODDemand3D - Ref formID %llx, base formID %llx", ref->formID, ref->data.objectReference->formID);
+			if (IsShield(ref->data.objectReference->formID)) {
+				_DEBUGMESSAGE("HookedOMODDemand3D - Returning nullptr for shield");
+				return nullptr;
+			}
+		}
+	}
+	typedef NiAVObject* (*FnDemand3D)(BGSMod::Attachment::Mod*, uintptr_t, bool, bool);
+	FnDemand3D fn = (FnDemand3D)Demand3DOrig;
+	NiAVObject* ret;
+	if (fn) {
+		ret = fn(mod, loadData, isFP, highres);
+		return ret;
+	}
+
+	return nullptr;
 }
 
 void SetMainOMODLooseMod(const OMODData& od)
@@ -428,15 +503,6 @@ void SetGroundOMODLooseMod(const OMODData& od)
 
 void AttachMainOMOD_Internal(Actor* a, const OMODData& od, BGSInventoryItem* invitem)
 {
-	/*bool succ = false;
-	BGSInventoryItem::ModifyModDataFunctor groundDetachFunc = BGSInventoryItem::ModifyModDataFunctor::ModifyModDataFunctor(sd.groundOMOD, 0xFFu, false, &succ);
-	if (!succ)
-		_MESSAGE("AttachMainOMOD_Internal - Detach Ground fail");
-	(&groundDetachFunc)->WriteDataImpl(object, stack);
-	BGSInventoryItem::ModifyModDataFunctor mainAttachFunc = BGSInventoryItem::ModifyModDataFunctor::ModifyModDataFunctor(sd.mainOMOD, 1, true, &succ);
-	if (!succ)
-		_MESSAGE("AttachMainOMOD_Internal - Attach Main fail");
-	(&mainAttachFunc)->WriteDataImpl(object, stack);*/
 	if (invitem->stackData->extra) {
 		BGSObjectInstanceExtra* extraData = (BGSObjectInstanceExtra*)invitem->stackData->extra->GetByType(EXTRA_DATA_TYPE::kObjectInstance);
 		if (extraData) {
@@ -448,15 +514,6 @@ void AttachMainOMOD_Internal(Actor* a, const OMODData& od, BGSInventoryItem* inv
 
 void AttachGroundOMOD_Internal(Actor* a, const OMODData& od, BGSInventoryItem* invitem)
 {
-	/*bool succ = false;
-	BGSInventoryItem::ModifyModDataFunctor mainDetachFunc = BGSInventoryItem::ModifyModDataFunctor::ModifyModDataFunctor(sd.mainOMOD, 0xFFu, false, &succ);
-	if (!succ)
-		_MESSAGE("AttachGroundOMOD_Internal - Detach Main fail");
-	(&mainDetachFunc)->WriteDataImpl(object, stack);
-	BGSInventoryItem::ModifyModDataFunctor groundAttachunc = BGSInventoryItem::ModifyModDataFunctor::ModifyModDataFunctor(sd.groundOMOD, 1, true, &succ);
-	if (!succ)
-		_MESSAGE("AttachGroundOMOD_Internal - Attach Ground fail");
-	(&groundAttachunc)->WriteDataImpl(object, stack);*/
 	if (invitem->stackData->extra) {
 		BGSObjectInstanceExtra* extraData = (BGSObjectInstanceExtra*)invitem->stackData->extra->GetByType(EXTRA_DATA_TYPE::kObjectInstance);
 		if (extraData) {
@@ -484,10 +541,6 @@ void AttachMainOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 							if (a == pc) {
 								SetMainOMODLooseMod(*omodit);
 							}
-							if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
-								a->SetBaseActorValue(*damageThresholdMul, 1.f);
-							}
-							a->SetBaseActorValue(*shieldHolder, 1.f);
 							omodDataCache.insert(std::pair<uint32_t, OMODData>(a->formID, *omodit));
 							_MESSAGE("Actor %llx Equip->AttachMainOMOD", a->formID);
 							return;
@@ -515,7 +568,6 @@ void AttachGroundOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 						if (a == pc) {
 							SetGroundOMODLooseMod(*omodit);
 						}
-						a->SetBaseActorValue(*shieldHolder, 0.f);
 						omodDataCache.erase(a->formID);
 						_MESSAGE("Actor %llx Unequip->AttachGroundOMOD", a->formID);
 						return;
@@ -529,6 +581,7 @@ void AttachGroundOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 void CheckShieldOMOD(Actor* a)
 {
 	if (!a->inventoryList) {
+		omodDataCache.erase(a->formID);
 		return;
 	}
 	bool hasShield = false;
@@ -537,7 +590,7 @@ void CheckShieldOMOD(Actor* a)
 		if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
 			auto sdlookup = GetShieldData(invitem->object->formID);
 			if (sdlookup != shieldDataMap.end()) {
-				_DEBUGMESSAGE("CheckShieldOMOD - Shield %llx", invitem->object->formID);
+				_DEBUGMESSAGE("CheckShieldOMOD - Weapon Shield %llx", invitem->object->formID);
 				for (auto omodit = sdlookup->second.omods.begin(); omodit != sdlookup->second.omods.end(); ++omodit) {
 					if (invitem->stackData->IsEquipped()) {
 						_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
@@ -568,15 +621,22 @@ void CheckShieldOMOD(Actor* a)
 					}
 				}
 			}
+		} else if (invitem->object->formType == ENUM_FORM_ID::kARMO) {
+			auto sdlookup = GetShieldData(invitem->object->formID);
+			if (sdlookup != shieldDataMap.end()) {
+				_DEBUGMESSAGE("CheckShieldOMOD - Armor Shield %llx", invitem->object->formID);
+				if (invitem->stackData->IsEquipped()) {
+					_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
+					if (!CheckPA(a)) {
+						GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
+					}
+				}
+			}
 		}
 	}
-	if (hasShield) {
-		a->SetBaseActorValue(*shieldHolder, 1.f);
-	} else {
-		a->SetBaseActorValue(*shieldHolder, 0.f);
+	if (!hasShield) {
 		omodDataCache.erase(a->formID);
 	}
-	_DEBUGMESSAGE("CheckShieldOMOD - Shield Holder %f", a->GetActorValue(*shieldHolder));
 }
 
 class EquipWatcher : public BSTEventSink<TESEquipEvent>
@@ -615,6 +675,9 @@ public:
 		if (form) {
 			if (form->formType == ENUM_FORM_ID::kACHR) {
 				Actor* a = static_cast<Actor*>(form);
+				if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
+					a->SetBaseActorValue(*damageThresholdMul, 1.f);
+				}
 				CheckShieldOMOD(a);
 			}
 		}
@@ -692,11 +755,16 @@ public:
 				continue;
 
 			Actor* a = (Actor*)it->collidee.get().get();
-			auto sdlookup = GetShieldData(a);
-			if (sdlookup != shieldDataMap.end()) {
-				OMODData* od = GetCurrentOMODData(a);
+			auto sdlist = GetEquippedShieldDataList(a);
+			for (auto sdlookup = sdlist.begin(); sdlookup != sdlist.end(); ++sdlookup) {
+				OMODData* od = nullptr;
+				if ((*sdlookup)->second.isWeapon) {
+					od = GetCurrentOMODData(a);
+				} else {
+					od = &(*sdlookup)->second.omods.at(0);
+				}
 				if (!od) {
-					_MESSAGE("CheckShield - Actor formID %llx Shield form ID %llx Couldn't retrieve OMODData!", a->formID, sdlookup->first);
+					_MESSAGE("HookedDoHitMe - Actor formID %llx Couldn't retrieve OMODData!", a->formID);
 				} else {
 					for (auto partit = od->parts.begin(); partit != od->parts.end(); ++partit) {
 						NiAVObject* parent = it->colObj.get()->sceneObject;
@@ -704,7 +772,7 @@ public:
 							if (partit->material) {
 								it->materialType = partit->material;
 							}
-							if (a == pc) {
+							if (a == pc && pcam->currentState != pcam->cameraStates[CameraState::kFree]) {
 								if (partit->imod) {
 									F4::ApplyImageSpaceModifier(partit->imod, 1.f, nullptr);
 								}
@@ -733,6 +801,10 @@ protected:
 };
 unordered_map<uintptr_t, ProjectileHooks::FnProcessImpacts> ProjectileHooks::fnHash;
 
+ShieldData ReadShieldData(TESForm* shieldForm, nlohmann::detail::iter_impl<nlohmann::json> shieldit)
+{
+}
+
 void InitializeShieldData()
 {
 	namespace fs = std::filesystem;
@@ -754,182 +826,282 @@ void InitializeShieldData()
 			nlohmann::json j;
 			reader >> j;
 
-			for (auto wepit = j.begin(); wepit != j.end(); ++wepit) {
-				std::string wepFormIDstr;
-				std::string wepPlugin = SplitString(wepit.key(), "|", wepFormIDstr);
-				if (wepFormIDstr.length() != 0) {
-					_MESSAGE("Getting Weapon: Form ID %s from %s", wepFormIDstr.c_str(), wepPlugin.c_str());
-					uint32_t wepFormID = std::stoi(wepFormIDstr, 0, 16);
-					TESForm* wepForm = GetFormFromMod(wepPlugin, wepFormID);
-					if (wepForm && wepForm->formType == ENUM_FORM_ID::kWEAP) {
-						uint32_t formID = wepForm->formID;
+			for (auto shieldit = j.begin(); shieldit != j.end(); ++shieldit) {
+				std::string shieldFormIDstr;
+				std::string shieldPlugin = SplitString(shieldit.key(), "|", shieldFormIDstr);
+				if (shieldFormIDstr.length() != 0) {
+					_MESSAGE("Getting Form: Form ID %s from %s", shieldFormIDstr.c_str(), shieldPlugin.c_str());
+					uint32_t shieldFormID = std::stoi(shieldFormIDstr, 0, 16);
+					TESForm* shieldForm = GetFormFromMod(shieldPlugin, shieldFormID);
+					if (shieldForm) {
+						uint32_t formID = shieldForm->formID;
 						_MESSAGE("Shield FormID %llx", formID);
-						if (shieldDataMap.find(formID) == shieldDataMap.end()) {
-							ShieldData shieldData;
-							auto omodlookup = (*wepit).find("OMODs");
-							if (omodlookup != (*wepit).end()) {
-								for (auto omodit = (*omodlookup).begin(); omodit != (*omodlookup).end(); ++omodit) {
-									OMODData od;
-									auto odlookup = (*omodit).find("MainOMOD");
-									if (odlookup != (*omodit).end()) {
-										std::string omodFormIDstr;
-										std::string omodPlugin = SplitString(odlookup.value().get<std::string>(), "|", omodFormIDstr);
-										if (omodFormIDstr.length() != 0) {
-											TESForm* omodForm = GetFormFromMod(omodPlugin, std::stoi(omodFormIDstr, 0, 16));
-											if (omodForm && omodForm->formType == ENUM_FORM_ID::kOMOD) {
-												od.mainOMOD = (BGSMod::Attachment::Mod*)omodForm;
-												_MESSAGE("Main OMOD FormID %llx", od.mainOMOD->formID);
+						if (shieldForm->formType == ENUM_FORM_ID::kWEAP) {
+							if (shieldDataMap.find(formID) == shieldDataMap.end()) {
+								ShieldData shieldData;
+								shieldData.isWeapon = true;
+								auto omodlookup = (*shieldit).find("OMODs");
+								if (omodlookup != (*shieldit).end()) {
+									for (auto omodit = (*omodlookup).begin(); omodit != (*omodlookup).end(); ++omodit) {
+										OMODData od;
+										auto odlookup = (*omodit).find("MainOMOD");
+										if (odlookup != (*omodit).end()) {
+											std::string omodFormIDstr;
+											std::string omodPlugin = SplitString(odlookup.value().get<std::string>(), "|", omodFormIDstr);
+											if (omodFormIDstr.length() != 0) {
+												TESForm* omodForm = GetFormFromMod(omodPlugin, std::stoi(omodFormIDstr, 0, 16));
+												if (omodForm && omodForm->formType == ENUM_FORM_ID::kOMOD) {
+													od.mainOMOD = (BGSMod::Attachment::Mod*)omodForm;
+													_MESSAGE("Main OMOD FormID %llx", od.mainOMOD->formID);
+												}
+											} else {
+												_MESSAGE("Main OMOD data invalid. Check JSON. Recevied %s", (omodPlugin + omodFormIDstr).c_str());
 											}
+										}
+										odlookup = (*omodit).find("GroundOMOD");
+										if (odlookup != (*omodit).end()) {
+											std::string omodFormIDstr;
+											std::string omodPlugin = SplitString(odlookup.value().get<std::string>(), "|", omodFormIDstr);
+											if (omodFormIDstr.length() != 0) {
+												TESForm* omodForm = GetFormFromMod(omodPlugin, std::stoi(omodFormIDstr, 0, 16));
+												if (omodForm && omodForm->formType == ENUM_FORM_ID::kOMOD) {
+													od.groundOMOD = (BGSMod::Attachment::Mod*)omodForm;
+													_MESSAGE("Ground OMOD FormID %llx", od.groundOMOD->formID);
+												}
+											} else {
+												_MESSAGE("Ground OMOD data invalid. Check JSON. Recevied %s", (omodPlugin + omodFormIDstr).c_str());
+											}
+										}
+										auto partlookup = (*omodit).find("Parts");
+										if (partlookup != (*omodit).end()) {
+											for (auto partit = (*partlookup).begin(); partit != (*partlookup).end(); ++partit) {
+												PartData pd;
+												pd.partName = partit.key();
+												auto lookup = (*partit).find("MaterialType");
+												if (lookup != (*partit).end()) {
+													BGSMaterialType* result = GetMaterialTypeByName(lookup.value().get<std::string>());
+													if (result) {
+														pd.material = result;
+														_MESSAGE("MaterialType %s found at %llx", lookup.value().get<std::string>().c_str(), result);
+													} else {
+														_MESSAGE("MaterialType %s not found", lookup.value().get<std::string>().c_str());
+													}
+												}
+												lookup = (*partit).find("SpellShielder");
+												if (lookup != (*partit).end()) {
+													std::string spellFormIDstr;
+													std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+													if (spellFormIDstr.length() > 0) {
+														TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+														if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+															pd.spell_victim = (SpellItem*)result;
+															_MESSAGE("SpellShielder - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+														} else {
+															_MESSAGE("SpellShielder - Spell %s not found", lookup.value().get<std::string>().c_str());
+														}
+													}
+												}
+												lookup = (*partit).find("SpellAttacker");
+												if (lookup != (*partit).end()) {
+													std::string spellFormIDstr;
+													std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+													if (spellFormIDstr.length() > 0) {
+														TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+														if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+															pd.spell_attacker = (SpellItem*)result;
+															_MESSAGE("SpellAttacker - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+														} else {
+															_MESSAGE("SpellAttacker - Spell %s not found", lookup.value().get<std::string>().c_str());
+														}
+													}
+												}
+												lookup = (*partit).find("SpellShielderOnBlock");
+												if (lookup != (*partit).end()) {
+													std::string spellFormIDstr;
+													std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+													if (spellFormIDstr.length() > 0) {
+														TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+														if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+															pd.spell_blocked_victim = (SpellItem*)result;
+															_MESSAGE("SpellShielderOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+														} else {
+															_MESSAGE("SpellShielderOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
+														}
+													}
+												}
+												lookup = (*partit).find("SpellAttackerOnBlock");
+												if (lookup != (*partit).end()) {
+													std::string spellFormIDstr;
+													std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+													if (spellFormIDstr.length() > 0) {
+														TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+														if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+															pd.spell_blocked_attacker = (SpellItem*)result;
+															_MESSAGE("SpellAttackerOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+														} else {
+															_MESSAGE("SpellAttackerOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
+														}
+													}
+												}
+												lookup = (*partit).find("IMOD");
+												if (lookup != (*partit).end()) {
+													std::string imodFormIDstr;
+													std::string imodPlugin = SplitString(lookup.value().get<std::string>(), "|", imodFormIDstr);
+													if (imodFormIDstr.length() > 0) {
+														TESForm* result = GetFormFromMod(imodPlugin, std::stoi(imodFormIDstr, 0, 16));
+														if (result && result->formType == ENUM_FORM_ID::kIMAD) {
+															pd.imod = (TESImageSpaceModifier*)result;
+															_MESSAGE("IMOD %s found at %llx", ((TESImageSpaceModifier*)result)->formEditorID.c_str(), result);
+														} else {
+															_MESSAGE("IMOD %s not found", lookup.value().get<std::string>().c_str());
+														}
+													}
+												}
+												lookup = (*partit).find("DamageThreshold");
+												if (lookup != (*partit).end()) {
+													pd.damageThreshold = lookup.value().get<float>();
+													_MESSAGE("DamageThreshold set to %f", pd.damageThreshold);
+												}
+												lookup = (*partit).find("ShakeDuration");
+												if (lookup != (*partit).end()) {
+													pd.shakeDuration = lookup.value().get<float>();
+													_MESSAGE("ShakeDuration set to %f", pd.shakeDuration);
+												}
+												lookup = (*partit).find("ShakeStrength");
+												if (lookup != (*partit).end()) {
+													pd.shakeStrength = lookup.value().get<float>();
+													_MESSAGE("ShakeStrength set to %f", pd.shakeStrength);
+												}
+												od.parts.push_back(pd);
+											}
+										}
+										if (od.mainOMOD && od.groundOMOD) {
+											shieldData.omods.push_back(od);
 										} else {
-											_MESSAGE("Main OMOD data invalid. Check JSON. Recevied %s", (omodPlugin + omodFormIDstr).c_str());
+											_MESSAGE("Main OMOD or Ground OMOD not set correctly.");
 										}
-									}
-									odlookup = (*omodit).find("GroundOMOD");
-									if (odlookup != (*omodit).end()) {
-										std::string omodFormIDstr;
-										std::string omodPlugin = SplitString(odlookup.value().get<std::string>(), "|", omodFormIDstr);
-										if (omodFormIDstr.length() != 0) {
-											TESForm* omodForm = GetFormFromMod(omodPlugin, std::stoi(omodFormIDstr, 0, 16));
-											if (omodForm && omodForm->formType == ENUM_FORM_ID::kOMOD) {
-												od.groundOMOD = (BGSMod::Attachment::Mod*)omodForm;
-												_MESSAGE("Ground OMOD FormID %llx", od.groundOMOD->formID);
-											}
-										} else {
-											_MESSAGE("Ground OMOD data invalid. Check JSON. Recevied %s", (omodPlugin + omodFormIDstr).c_str());
-										}
-									}
-									odlookup = (*omodit).find("MeleeThreshold");
-									if (odlookup != (*omodit).end()) {
-										od.meleeThreshold = odlookup.value().get<float>();
-										_MESSAGE("MeleeThreshold set to %f", od.meleeThreshold);
-									}
-									odlookup = (*omodit).find("ExplosionThreshold");
-									if (odlookup != (*omodit).end()) {
-										od.explosionThreshold = odlookup.value().get<float>();
-										_MESSAGE("ExplosionThreshold set to %f", od.explosionThreshold);
-									}
-									odlookup = (*omodit).find("DefenseAng");
-									if (odlookup != (*omodit).end()) {
-										od.defenseAng = odlookup.value().get<float>() * toRad;
-										_MESSAGE("DefenseAng set to %f", od.defenseAng / toRad);
-									}
-									auto partlookup = (*omodit).find("Parts");
-									if (partlookup != (*omodit).end()) {
-										for (auto partit = (*partlookup).begin(); partit != (*partlookup).end(); ++partit) {
-											PartData pd;
-											pd.partName = partit.key();
-											auto lookup = (*partit).find("MaterialType");
-											if (lookup != (*partit).end()) {
-												BGSMaterialType* result = GetMaterialTypeByName(lookup.value().get<std::string>());
-												if (result) {
-													pd.material = result;
-													_MESSAGE("MaterialType %s found at %llx", lookup.value().get<std::string>().c_str(), result);
-												} else {
-													_MESSAGE("MaterialType %s not found", lookup.value().get<std::string>().c_str());
-												}
-											}
-											lookup = (*partit).find("SpellShielder");
-											if (lookup != (*partit).end()) {
-												std::string spellFormIDstr;
-												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
-												if (spellFormIDstr.length() > 0) {
-													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
-													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
-														pd.spell_victim = (SpellItem*)result;
-														_MESSAGE("SpellShielder - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
-													} else {
-														_MESSAGE("SpellShielder - Spell %s not found", lookup.value().get<std::string>().c_str());
-													}
-												}
-											}
-											lookup = (*partit).find("SpellAttacker");
-											if (lookup != (*partit).end()) {
-												std::string spellFormIDstr;
-												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
-												if (spellFormIDstr.length() > 0) {
-													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
-													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
-														pd.spell_attacker = (SpellItem*)result;
-														_MESSAGE("SpellAttacker - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
-													} else {
-														_MESSAGE("SpellAttacker - Spell %s not found", lookup.value().get<std::string>().c_str());
-													}
-												}
-											}
-											lookup = (*partit).find("SpellShielderOnBlock");
-											if (lookup != (*partit).end()) {
-												std::string spellFormIDstr;
-												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
-												if (spellFormIDstr.length() > 0) {
-													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
-													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
-														pd.spell_blocked_victim = (SpellItem*)result;
-														_MESSAGE("SpellShielderOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
-													} else {
-														_MESSAGE("SpellShielderOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
-													}
-												}
-											}
-											lookup = (*partit).find("SpellAttackerOnBlock");
-											if (lookup != (*partit).end()) {
-												std::string spellFormIDstr;
-												std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
-												if (spellFormIDstr.length() > 0) {
-													TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
-													if (result && result->formType == ENUM_FORM_ID::kSPEL) {
-														pd.spell_blocked_attacker = (SpellItem*)result;
-														_MESSAGE("SpellAttackerOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
-													} else {
-														_MESSAGE("SpellAttackerOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
-													}
-												}
-											}
-											lookup = (*partit).find("IMOD");
-											if (lookup != (*partit).end()) {
-												std::string imodFormIDstr;
-												std::string imodPlugin = SplitString(lookup.value().get<std::string>(), "|", imodFormIDstr);
-												if (imodFormIDstr.length() > 0) {
-													TESForm* result = GetFormFromMod(imodPlugin, std::stoi(imodFormIDstr, 0, 16));
-													if (result && result->formType == ENUM_FORM_ID::kIMAD) {
-														pd.imod = (TESImageSpaceModifier*)result;
-														_MESSAGE("IMOD %s found at %llx", ((TESImageSpaceModifier*)result)->formEditorID.c_str(), result);
-													} else {
-														_MESSAGE("IMOD %s not found", lookup.value().get<std::string>().c_str());
-													}
-												}
-											}
-											lookup = (*partit).find("DamageThreshold");
-											if (lookup != (*partit).end()) {
-												pd.damageThreshold = lookup.value().get<float>();
-												_MESSAGE("DamageThreshold set to %f", pd.damageThreshold);
-											}
-											lookup = (*partit).find("ShakeDuration");
-											if (lookup != (*partit).end()) {
-												pd.shakeDuration = lookup.value().get<float>();
-												_MESSAGE("ShakeDuration set to %f", pd.shakeDuration);
-											}
-											lookup = (*partit).find("ShakeStrength");
-											if (lookup != (*partit).end()) {
-												pd.shakeStrength = lookup.value().get<float>();
-												_MESSAGE("ShakeStrength set to %f", pd.shakeStrength);
-											}
-											od.parts.push_back(pd);
-										}
-									}
-									if (od.mainOMOD && od.groundOMOD) {
-										shieldData.omods.push_back(od);
-									} else {
-										_MESSAGE("Main OMOD or Ground OMOD not set correctly.");
 									}
 								}
+								shieldDataMap.insert(std::pair<uint32_t, ShieldData>(formID, shieldData));
 							}
-							shieldDataMap.insert(std::pair<uint32_t, ShieldData>(formID, shieldData));
+						} else if (shieldForm->formType == ENUM_FORM_ID::kARMO) {
+							if (shieldDataMap.find(formID) == shieldDataMap.end()) {
+								ShieldData shieldData;
+								OMODData od;
+								auto partlookup = (*shieldit).find("Parts");
+								if (partlookup != (*shieldit).end()) {
+									for (auto partit = (*partlookup).begin(); partit != (*partlookup).end(); ++partit) {
+										PartData pd;
+										pd.partName = partit.key();
+										auto lookup = (*partit).find("MaterialType");
+										if (lookup != (*partit).end()) {
+											BGSMaterialType* result = GetMaterialTypeByName(lookup.value().get<std::string>());
+											if (result) {
+												pd.material = result;
+												_MESSAGE("MaterialType %s found at %llx", lookup.value().get<std::string>().c_str(), result);
+											} else {
+												_MESSAGE("MaterialType %s not found", lookup.value().get<std::string>().c_str());
+											}
+										}
+										lookup = (*partit).find("SpellShielder");
+										if (lookup != (*partit).end()) {
+											std::string spellFormIDstr;
+											std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+											if (spellFormIDstr.length() > 0) {
+												TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+												if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+													pd.spell_victim = (SpellItem*)result;
+													_MESSAGE("SpellShielder - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+												} else {
+													_MESSAGE("SpellShielder - Spell %s not found", lookup.value().get<std::string>().c_str());
+												}
+											}
+										}
+										lookup = (*partit).find("SpellAttacker");
+										if (lookup != (*partit).end()) {
+											std::string spellFormIDstr;
+											std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+											if (spellFormIDstr.length() > 0) {
+												TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+												if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+													pd.spell_attacker = (SpellItem*)result;
+													_MESSAGE("SpellAttacker - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+												} else {
+													_MESSAGE("SpellAttacker - Spell %s not found", lookup.value().get<std::string>().c_str());
+												}
+											}
+										}
+										lookup = (*partit).find("SpellShielderOnBlock");
+										if (lookup != (*partit).end()) {
+											std::string spellFormIDstr;
+											std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+											if (spellFormIDstr.length() > 0) {
+												TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+												if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+													pd.spell_blocked_victim = (SpellItem*)result;
+													_MESSAGE("SpellShielderOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+												} else {
+													_MESSAGE("SpellShielderOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
+												}
+											}
+										}
+										lookup = (*partit).find("SpellAttackerOnBlock");
+										if (lookup != (*partit).end()) {
+											std::string spellFormIDstr;
+											std::string spellPlugin = SplitString(lookup.value().get<std::string>(), "|", spellFormIDstr);
+											if (spellFormIDstr.length() > 0) {
+												TESForm* result = GetFormFromMod(spellPlugin, std::stoi(spellFormIDstr, 0, 16));
+												if (result && result->formType == ENUM_FORM_ID::kSPEL) {
+													pd.spell_blocked_attacker = (SpellItem*)result;
+													_MESSAGE("SpellAttackerOnBlock - Spell %s found at %llx", ((SpellItem*)result)->fullName.c_str(), result);
+												} else {
+													_MESSAGE("SpellAttackerOnBlock - Spell %s not found", lookup.value().get<std::string>().c_str());
+												}
+											}
+										}
+										lookup = (*partit).find("IMOD");
+										if (lookup != (*partit).end()) {
+											std::string imodFormIDstr;
+											std::string imodPlugin = SplitString(lookup.value().get<std::string>(), "|", imodFormIDstr);
+											if (imodFormIDstr.length() > 0) {
+												TESForm* result = GetFormFromMod(imodPlugin, std::stoi(imodFormIDstr, 0, 16));
+												if (result && result->formType == ENUM_FORM_ID::kIMAD) {
+													pd.imod = (TESImageSpaceModifier*)result;
+													_MESSAGE("IMOD %s found at %llx", ((TESImageSpaceModifier*)result)->formEditorID.c_str(), result);
+												} else {
+													_MESSAGE("IMOD %s not found", lookup.value().get<std::string>().c_str());
+												}
+											}
+										}
+										lookup = (*partit).find("DamageThreshold");
+										if (lookup != (*partit).end()) {
+											pd.damageThreshold = lookup.value().get<float>();
+											_MESSAGE("DamageThreshold set to %f", pd.damageThreshold);
+										}
+										lookup = (*partit).find("ShakeDuration");
+										if (lookup != (*partit).end()) {
+											pd.shakeDuration = lookup.value().get<float>();
+											_MESSAGE("ShakeDuration set to %f", pd.shakeDuration);
+										}
+										lookup = (*partit).find("ShakeStrength");
+										if (lookup != (*partit).end()) {
+											pd.shakeStrength = lookup.value().get<float>();
+											_MESSAGE("ShakeStrength set to %f", pd.shakeStrength);
+										}
+										od.parts.push_back(pd);
+									}
+								}
+								shieldData.omods.push_back(od);
+								shieldDataMap.insert(std::pair<uint32_t, ShieldData>(formID, shieldData));
+							} else {
+								_MESSAGE("Invalid form type. Should be weapon or armor");
+							}
+						} else {
+							_MESSAGE("Invalid form.");
 						}
 					} else {
-						_MESSAGE("Invalid form or form is not a weapon.");
+						_MESSAGE("Shield data invalid. Check JSON. Recevied %s", (shieldPlugin + shieldFormIDstr).c_str());
 					}
-				} else {
-					_MESSAGE("Weapon data invalid. Check JSON. Recevied %s", (wepPlugin + wepFormIDstr).c_str());
 				}
 			}
 		}
@@ -1151,7 +1323,7 @@ void InitializeFramework()
 
 	damageThresholdAdd = GetAVIFByEditorID(std::string("ShieldDTAdd"));
 	damageThresholdMul = GetAVIFByEditorID(std::string("ShieldDTMul"));
-	shieldHolder = GetAVIFByEditorID(std::string("ShieldHolder"));
+	colCheckProj = (BGSProjectile*)GetFormFromMod("ShieldFramework.esm", 0x2682);
 
 	pc = PlayerCharacter::GetSingleton();
 	pcam = PlayerCamera::GetSingleton();
@@ -1211,6 +1383,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f
 	F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
 	DoHitMeOrig = trampoline.write_call<5>(ptr_DoHitMe.address(), &HookedDoHitMe);
 	UpdateSceneGraphOrig = trampoline.write_call<5>(ptr_UpdateSceneGraph.address(), &HookedUpdateSceneGraph);
+	Demand3DOrig = trampoline.write_call<5>(ptr_Demand3D.address(), &HookedOMODDemand3D);
 
 	const F4SE::MessagingInterface* message = F4SE::GetMessagingInterface();
 	message->RegisterListener([](F4SE::MessagingInterface::Message* msg) -> void {
