@@ -5,7 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
-#define DEBUG
+//#define DEBUG
 
 #ifdef DEBUG
 #define _DEBUGMESSAGE(fmt, ...) _MESSAGE(fmt __VA_OPT__(, ) __VA_ARGS__)
@@ -53,6 +53,7 @@ static uintptr_t UpdateSceneGraphOrig;
 static uintptr_t Demand3DOrig;
 static unordered_map<uint32_t, ShieldData> shieldDataMap;
 static unordered_map<uint32_t, OMODData> omodDataCache;	 //Used for weapons only
+static unordered_map<std::string, char> shieldPartsCache;
 static ActorValueInfo* damageThresholdAdd;
 static ActorValueInfo* damageThresholdMul;
 static BGSProjectile* colCheckProj;
@@ -72,8 +73,6 @@ const static unordered_map<std::string, char> animatedBones = {
 	{ "Spine1", 0 },
 	{ "Spine2", 0 },
 	{ "Chest", 0 },
-	{ "Neck", 0 },
-	{ "Head", 0 },
 	{ "LArm_Collarbone", 0 },
 	{ "LArm_UpperArm", 0 },
 	{ "LArm_ForeArm1", 0 },
@@ -306,7 +305,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 						F4::bhkPickData pick = F4::bhkPickData();
 						dirAttacker.z = 0;
 						dirAttacker = Normalize(dirAttacker);
-						GetPickData(attackerCenter + dirAttacker * 30.f, attackerCenter + dirAttacker * 1000.f, (Actor*)attacker, colCheckProj, pick);
+						GetPickData(attackerCenter, attackerCenter + dirAttacker * 1000.f, (Actor*)attacker, colCheckProj, pick);
 						if (pick.HasHit()) {
 							NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60), *(float*)((uintptr_t)&pick + 0x64), *(float*)((uintptr_t)&pick + 0x68)) / *ptr_fBS2HkScale;
 							NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, dirAttacker);
@@ -353,7 +352,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 							((TESObjectREFREx*)a)->GetObjectCenter(actorCenter);
 							F4::bhkPickData pick = F4::bhkPickData();
 							NiPoint3 expDir = Normalize(NiPoint3(actorCenter - source->data.location));
-							GetPickData(source->data.location + expDir * 30.f, source->data.location + expDir * 5000.f, a, colCheckProj, pick, false);
+							GetPickData(source->data.location, source->data.location + expDir * 5000.f, a, colCheckProj, pick, false);
 							if (pick.HasHit()) {
 								NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60), *(float*)((uintptr_t)&pick + 0x64), *(float*)((uintptr_t)&pick + 0x68)) / *ptr_fBS2HkScale;
 								NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, expDir);
@@ -578,13 +577,65 @@ void AttachGroundOMOD(Actor* a, uint32_t formId, const ShieldData& sd)
 	}
 }
 
-void CheckShieldOMOD(Actor* a)
+void ActivateShieldCollisionObjects(Actor* a)
+{
+	if (!a || !a->Get3D(false)) {
+		_DEBUGMESSAGE("ActivateShieldCollisionObjects - Actor does not exist!");
+		return;
+	}
+	if (!a->parentCell) {
+		_DEBUGMESSAGE("ActivateShieldCollisionObjects - Actor formID %llx does not have a parent cell!", a->formID);
+		return;
+	}
+	NiNode* node = (NiNode*)a->Get3D(false)->IsNode();
+	bhkWorld* world = a->parentCell->GetbhkWorld();
+	if (node && node->children[0].get()) {
+		Visit(node->children[0].get(), [&](NiAVObject* obj) {
+			if (obj->name.length() != 0 && obj->collisionObject) {
+				if (shieldPartsCache.find(obj->name.c_str()) != shieldPartsCache.end()) {
+					_DEBUGMESSAGE("ActivateShieldCollisionObjects - Part %s is in database. Activating collision", obj->name.c_str());
+					Visit(obj, [a, world](NiAVObject* obj) {
+						if (!obj->collisionObject)
+							return false;
+
+						_DEBUGMESSAGE("Collision object found at obj %llx", obj);
+						bhkNPCollisionObject* colObj = obj->collisionObject->IsbhkNPCollisionObject();
+						if (!colObj || !world) {
+							_DEBUGMESSAGE("Obj is not bhkNPCollisionObject or bhkWorld does not exist");
+							return false;
+						}
+						hknpBSWorld* hkWorld = *(hknpBSWorld**)((uintptr_t)world + 0x60);
+						if (hkWorld) {
+							hkWorld->MarkForWrite();
+						}
+						colObj->CreateInstance(*world);
+						CFilter filter;
+						filter.filter = ((((ActorEx*)a)->GetCollisionFilter().filter >> 16) << 16) | 0x1408;
+						colObj->SetCollisionFilterInfo(filter);
+						colObj->SetMotionType(hknpMotionPropertiesId::Preset::KEYFRAMED);
+						if (hkWorld) {
+							hkWorld->UnmarkForWrite();
+						}
+						return false;
+					});
+					_DEBUGMESSAGE("ActivateShieldCollisionObjects - Done", obj->name.c_str());
+				}
+			}
+			return false;
+		});
+	} else {
+		_MESSAGE("ActivateShieldCollisionObjects - Actor formID %llx does not have Root node", a->formID);
+	}
+}
+
+void CheckShieldOMOD(Actor* a, bool forceRequip = false)
 {
 	if (!a->inventoryList) {
 		omodDataCache.erase(a->formID);
 		return;
 	}
 	bool hasShield = false;
+	bool activateCollision = false;
 	_DEBUGMESSAGE("CheckShieldOMOD - Actor %llx", a->formID);
 	for (auto invitem = a->inventoryList->data.begin(); invitem != a->inventoryList->data.end(); ++invitem) {
 		if (invitem->object->formType == ENUM_FORM_ID::kWEAP) {
@@ -596,16 +647,15 @@ void CheckShieldOMOD(Actor* a)
 						_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
 						if (HasMod(invitem, omodit->groundOMOD)) {
 							AttachMainOMOD_Internal(a, *omodit, invitem);
-							if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
-								a->SetBaseActorValue(*damageThresholdMul, 1.f);
-							}
 							GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
 							hasShield = true;
 							_MESSAGE("Actor %llx CheckShieldOMOD->AttachMainOMOD", a->formID);
 							break;
 						} else if (HasMod(invitem, omodit->mainOMOD)) {
-							if (!CheckPA(a)) {
-								GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
+							if (!CheckPA(a) || forceRequip) {
+								//GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
+								activateCollision = true;
+								//_DEBUGMESSAGE("CheckShieldOMOD - Reequipping Weapon");
 							}
 							hasShield = true;
 							_DEBUGMESSAGE("CheckShieldOMOD - Shield already has mainOMOD");
@@ -627,8 +677,10 @@ void CheckShieldOMOD(Actor* a)
 				_DEBUGMESSAGE("CheckShieldOMOD - Armor Shield %llx", invitem->object->formID);
 				if (invitem->stackData->IsEquipped()) {
 					_DEBUGMESSAGE("CheckShieldOMOD - Is Equipped");
-					if (!CheckPA(a)) {
-						GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
+					if (!CheckPA(a) || forceRequip) {
+						//GameScript::PostModifyInventoryItemMod(a, invitem->object, false);
+						activateCollision = true;
+						//_DEBUGMESSAGE("CheckShieldOMOD - Reequipping Armor");
 					}
 				}
 			}
@@ -636,6 +688,9 @@ void CheckShieldOMOD(Actor* a)
 	}
 	if (!hasShield) {
 		omodDataCache.erase(a->formID);
+	}
+	if (activateCollision) {
+		ActivateShieldCollisionObjects(a);
 	}
 }
 
@@ -675,9 +730,6 @@ public:
 		if (form) {
 			if (form->formType == ENUM_FORM_ID::kACHR) {
 				Actor* a = static_cast<Actor*>(form);
-				if (a->GetBaseActorValue(*damageThresholdMul) == 0) {
-					a->SetBaseActorValue(*damageThresholdMul, 1.f);
-				}
 				CheckShieldOMOD(a);
 			}
 		}
@@ -697,10 +749,10 @@ class MenuWatcher : public BSTEventSink<MenuOpenCloseEvent>
 				for (auto it = highActorHandles->begin(); it != highActorHandles->end(); ++it) {
 					Actor* a = it->get().get();
 					if (a && a->Get3D())
-						CheckShieldOMOD(a);
+						CheckShieldOMOD(a, true);
 				}
 			}
-			CheckShieldOMOD(pc);
+			CheckShieldOMOD(pc, true);
 		} else if (evn.menuName == BSFixedString("ExamineMenu")) {
 			if (pc->interactingState != INTERACTING_STATE::kNotInteracting) {
 				if (evn.opening) {
@@ -801,10 +853,6 @@ protected:
 };
 unordered_map<uintptr_t, ProjectileHooks::FnProcessImpacts> ProjectileHooks::fnHash;
 
-ShieldData ReadShieldData(TESForm* shieldForm, nlohmann::detail::iter_impl<nlohmann::json> shieldit)
-{
-}
-
 void InitializeShieldData()
 {
 	namespace fs = std::filesystem;
@@ -877,6 +925,9 @@ void InitializeShieldData()
 											for (auto partit = (*partlookup).begin(); partit != (*partlookup).end(); ++partit) {
 												PartData pd;
 												pd.partName = partit.key();
+												if (shieldPartsCache.find(pd.partName) == shieldPartsCache.end()) {
+													shieldPartsCache.insert(std::pair<std::string, char>(pd.partName, 0));
+												}
 												auto lookup = (*partit).find("MaterialType");
 												if (lookup != (*partit).end()) {
 													BGSMaterialType* result = GetMaterialTypeByName(lookup.value().get<std::string>());
@@ -993,6 +1044,9 @@ void InitializeShieldData()
 									for (auto partit = (*partlookup).begin(); partit != (*partlookup).end(); ++partit) {
 										PartData pd;
 										pd.partName = partit.key();
+										if (shieldPartsCache.find(pd.partName) == shieldPartsCache.end()) {
+											shieldPartsCache.insert(std::pair<std::string, char>(pd.partName, 0));
+										}
 										auto lookup = (*partit).find("MaterialType");
 										if (lookup != (*partit).end()) {
 											BGSMaterialType* result = GetMaterialTypeByName(lookup.value().get<std::string>());
