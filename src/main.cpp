@@ -48,6 +48,7 @@ REL::Relocation<uintptr_t> ProcessProjectileFX{ REL::ID(806412), ProcessProjecti
 REL::Relocation<uintptr_t> ptr_DoHitMe{ REL::ID(1546751), 0x921 };
 REL::Relocation<uintptr_t> ptr_UpdateSceneGraph{ REL::ID(1318162), 0xD5 };
 REL::Relocation<uintptr_t> ptr_Demand3D{ REL::ID(736753), 0xB4 };
+static bhkPickData* pick;
 static uintptr_t DoHitMeOrig;
 static uintptr_t UpdateSceneGraphOrig;
 static uintptr_t Demand3DOrig;
@@ -302,13 +303,13 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 						NiPoint3 eyeAttacker, dirAttacker, attackerCenter;
 						((ActorEx*)attacker)->GetEyeVector(eyeAttacker, dirAttacker, false);
 						((TESObjectREFREx*)attacker)->GetObjectCenter(attackerCenter);
-						F4::bhkPickData pick = F4::bhkPickData();
 						dirAttacker.z = 0;
 						dirAttacker = Normalize(dirAttacker);
-						GetPickData(attackerCenter, attackerCenter + dirAttacker * 1000.f, (Actor*)attacker, colCheckProj, pick);
-						if (pick.HasHit()) {
-							NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60), *(float*)((uintptr_t)&pick + 0x64), *(float*)((uintptr_t)&pick + 0x68)) / *ptr_fBS2HkScale;
-							NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, dirAttacker);
+						GetPickData(attackerCenter, attackerCenter + dirAttacker * 1000.f, (Actor*)attacker, colCheckProj, *pick);
+						if (pick->HasHit()) {
+							NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)pick + 0x60), *(float*)((uintptr_t)pick + 0x64), *(float*)((uintptr_t)pick + 0x68)) / *ptr_fBS2HkScale;
+							//NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, dirAttacker);
+							NiAVObject* closestBone = pick->GetNiAVObject();
 							_DEBUGMESSAGE("HookedDoHitMe - Closest Bone %llx (%s)", closestBone, closestBone->name.c_str());
 							if (closestBone) {
 								for (auto partit = od->parts.begin(); partit != od->parts.end(); ++partit) {
@@ -326,6 +327,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 								}
 							}
 						}
+						pick->Reset();
 					}
 				} else {
 					TESObjectREFR* source = hitData.sourceHandle.get().get();
@@ -350,12 +352,12 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 						if ((baseProj && baseProj->data.explosionType) || source->GetObjectReference()->formType == ENUM_FORM_ID::kEXPL) {
 							NiPoint3 actorCenter;
 							((TESObjectREFREx*)a)->GetObjectCenter(actorCenter);
-							F4::bhkPickData pick = F4::bhkPickData();
 							NiPoint3 expDir = Normalize(NiPoint3(actorCenter - source->data.location));
-							GetPickData(source->data.location, source->data.location + expDir * 5000.f, a, colCheckProj, pick, false);
-							if (pick.HasHit()) {
-								NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)&pick + 0x60), *(float*)((uintptr_t)&pick + 0x64), *(float*)((uintptr_t)&pick + 0x68)) / *ptr_fBS2HkScale;
-								NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, expDir);
+							GetPickData(source->data.location, source->data.location + expDir * 5000.f, a, colCheckProj, *pick, false);
+							if (pick->HasHit()) {
+								NiPoint3 pickPos = NiPoint3(*(float*)((uintptr_t)pick + 0x60), *(float*)((uintptr_t)pick + 0x64), *(float*)((uintptr_t)pick + 0x68)) / *ptr_fBS2HkScale;
+								//NiAVObject* closestBone = ((ActorEx*)a)->GetClosestBone(pickPos, dirAttacker);
+								NiAVObject* closestBone = pick->GetNiAVObject();
 								_DEBUGMESSAGE("HookedDoHitMe - Closest Bone %llx (%s)", closestBone, closestBone->name.c_str());
 								if (closestBone) {
 									for (auto partit = od->parts.begin(); partit != od->parts.end(); ++partit) {
@@ -373,6 +375,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 									}
 								}
 							}
+							pick->Reset();
 						}
 					}
 				}
@@ -415,7 +418,7 @@ void HookedDoHitMe(Actor* a, HitData& hitData)
 
 void HookedUpdateSceneGraph(PlayerCharacter* p)
 {
-	if (p->Get3D(true) == p->Get3D()) {
+	if (p->Get3D() && p->Get3D(true) == p->Get3D()) {
 		NiAVObject* fpNode = p->Get3D(true);
 		NiAVObject* tpNode = p->Get3D(false);
 #ifdef DEBUG
@@ -1381,6 +1384,7 @@ void InitializeFramework()
 
 	pc = PlayerCharacter::GetSingleton();
 	pcam = PlayerCamera::GetSingleton();
+	pick = new bhkPickData();
 	_MESSAGE("PlayerCharacter %llx", pc);
 }
 
